@@ -1,0 +1,737 @@
+---
+title: "SocKultExam"
+author: "Lasse Hansen"
+date: "May 6, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+setwd("~/Desktop/SocKultExam/Audio_Speech_Actors_01-24")
+
+p_load(tidyverse, rethinking, brms, glmnet, lme4, caret, groupdata2, pROC)
+```
+    Modality (01 = full-AV, 02 = video-only, 03 = audio-only).
+    Vocal channel (01 = speech, 02 = song).
+    Emotion (01 = neutral, 02 = calm, 03 = happy, 04 = sad, 05 = angry, 06 = fearful, 07 = disgust, 08 = surprised).
+    Emotional intensity (01 = normal, 02 = strong). NOTE: There is no strong intensity for the 'neutral' emotion.
+    Statement (01 = "Kids are talking by the door", 02 = "Dogs are sitting by the door").
+    Repetition (01 = 1st repetition, 02 = 2nd repetition).
+    Actor (01 to 24. Odd numbered actors are male, even numbered actors are female).
+
+##Function to load, add column for filename, and trim the dfs so only rows where there is speech are kept
+```{r}
+trimload = function(file){
+  df = read_csv(file)
+  df = df[!df$NAQ==0,]
+  df$filename = as.factor(file)
+  return(df)
+}
+```
+
+
+#Preprocessing. Loading and adding identification columns
+```{r}
+#creating a list of the folders where the files are
+folders = list.files(pattern = "Actor*")
+#creating a list of all the .csv files in all the folders
+file.list <- list.files(folders, pattern = '*.csv', full.names = T)
+
+
+#reading all the csv files in the file.list
+df.list <- lapply(file.list, trimload)
+#turning into a data frame
+dfTrim = bind_rows(df.list)
+
+#adding identification columns
+dfTrim$emotion = as.numeric(str_sub(dfTrim$filename, start = 16, end = 17))
+dfTrim$intensity = as.numeric(str_sub(dfTrim$filename, start = 19, end = 20))
+dfTrim$statement = as.numeric(str_sub(dfTrim$filename, start = 22, end = 23))
+dfTrim$repetition = as.numeric(str_sub(dfTrim$filename, start = 25, end = 26))
+dfTrim$actor = as.numeric(str_sub(dfTrim$filename, start = 28, end = 29))
+#adding gender column
+dfTrim$gender = as.factor(ifelse(dfTrim$actor %% 2 == 0, 'female', 'male'))
+#adding dummy columns for each emotion we are interested in   
+dfTrim$neutral = ifelse(dfTrim$emotion == 1, 1, 0)
+dfTrim$happy = ifelse(dfTrim$emotion == 3, 1, 0)
+dfTrim$sad = ifelse(dfTrim$emotion == 4, 1, 0)
+dfTrim$angry = ifelse(dfTrim$emotion == 5, 1, 0)
+
+#creating subset of data containing only the emotions we are interested in
+dfTrim2 = dfTrim %>% filter(neutral == 1 | happy == 1 | sad == 1 | angry == 1)
+
+#saving files
+#write.csv(dfTrim, file = "allDataTrim.csv")
+#write.csv(dfTrim2, file = "filteredEmotionsTrim.csv")
+```
+
+#Summarising with median and IQR
+```{r}
+df = read_csv("filteredEmotionsTrim.csv")
+df$X1 = NULL
+
+df = df[complete.cases(df),]
+
+
+sumdf = df %>% 
+  group_by(filename) %>% 
+  summarise_at(.vars = names(.)[1:81],
+               .funs = c(median="median", IQR = "IQR"))
+#adding IDs
+df$emotion = as.numeric(str_sub(df$filename, start = 16, end = 17))
+df$intensity = as.numeric(str_sub(df$filename, start = 19, end = 20))
+df$statement = as.numeric(str_sub(df$filename, start = 22, end = 23))
+df$repetition = as.numeric(str_sub(df$filename, start = 25, end = 26))
+df$actor = as.numeric(str_sub(df$filename, start = 28, end = 29))
+#adding gender column
+df$gender = as.factor(ifelse(df$actor %% 2 == 0, 'female', 'male'))
+#adding dummy columns for each emotion we are interested in   
+df$neutral = ifelse(df$emotion == 1, 1, 0)
+df$happy = ifelse(df$emotion == 3, 1, 0)
+df$sad = ifelse(df$emotion == 4, 1, 0)
+df$angry = ifelse(df$emotion == 5, 1, 0)
+
+#write.csv(df, file = "TrimSumData.csv")
+
+```
+
+
+#Preparing data for elastic net
+```{r}
+df <- read.csv("TrimSumData.csv")
+df$X <- NULL
+
+#removing columns with only zeros (become NA's when scaled = glmnet not happy)
+df$HMPDM_0_median <- NULL
+df$HMPDM_0_IQR <- NULL
+df$HMPDM_1_median <- NULL
+df$HMPDM_1_IQR <- NULL
+df$vowelSpace_median <- NULL
+df$vowelSpace_IQR <- NULL
+
+#only keeping neutral, happy, sad, angry
+df = df %>% filter(emotion == 3 | emotion == 5 | emotion == 1 | emotion == 4)
+
+
+#creating predictor column 
+Predictors <- df[, -c(158:168)]
+Predictors$filename = NULL
+
+#Creating outcome variables
+yAngry <- select(df, angry)
+ySad <- select(df, sad)
+yNeutral <- select(df, neutral)
+yHappy <- select(df, happy)
+
+#no NA's 
+#identical(Predictors, Predictors[complete.cases(Predictors),])
+```
+
+##Running the elastic net
+```{r}
+## Define predictors and outcome
+x   <- model.matrix(~.-1, data= Predictors) # where all the columns except the first are predictors
+
+# makes outcome variables into a non data frame because glmnet doesn’t deal with dataframes
+yAngry=as.numeric(unlist(yAngry))
+ySad=as.numeric(unlist(ySad))
+yNeutral=as.numeric(unlist(yNeutral))
+yHappy=as.numeric(unlist(yHappy))
+
+
+#scale all features
+x=scale(x)[,] ##testing
+
+#function to run the elastic net. First chooses the optimal alpha, then runs the elastic net
+elasticfun = function(y){
+  # Define cross-validated alpha selection (alpha indicates how strong the correlation btw predictors should be for it to be taken   into account when discarding predictors)
+  alphaslist<-seq(0,1,by=0.1)
+  foldslist<-seq(4,12)
+  pars=expand.grid(alphaslist,foldslist)
+
+  cvm1=matrix(rep(0,length(alphaslist)))
+
+  elasticnet1<-lapply(1:length(cvm1), 
+                  function(a){
+                    cv.glmnet(x, y, alpha=alphaslist[a], family="binomial", 
+                                                         lambda.min.ratio=.001,nfolds = 5)})
+
+  for (i in 1:length(alphaslist)) {cvm1[i]=min(elasticnet1[[i]]$cvm)}
+
+  n1=which(cvm1==min(cvm1))
+
+  alpha1=alphaslist[n1]
+
+# Run cross-validated elastic net with the chosen alpha (to choose lambda)
+  mod_cv <- cv.glmnet(x=x, y=y, family='binomial', alpha=alpha1, nfolds=5) # Modify family if not binomial
+  coefs=as.data.frame(as.matrix(coef(mod_cv, mod_cv$lambda.1se)))
+  coefs$predictors<-rownames(coefs)
+  rownames(coefs) <- NULL
+  names(coefs)[1] <- "betas"
+  coefs=subset(coefs,betas!=0)
+  coefs1=coefs[order(abs(coefs$betas)),]
+  return(coefs1)
+}
+
+
+angryNet = elasticfun(yAngry)
+sadNet = elasticfun(ySad)
+neutralNet = elasticfun(yNeutral)
+happyNet = elasticfun(yHappy)
+
+# #saving values
+# save(angryNet, file = "angryNet.RData")
+# save(sadNet, file = "sadNet.RData")
+# save(neutralNet, file = "neutralNet.RData")
+# save(happyNet, file = "happyNet.RData")
+
+load('angryNet.RData')
+load('sadNet.RData')
+load('neutralNet.RData')
+load('happyNet.RData')
+```
+
+##Creating models and calculating confusion matrix
+```{r}
+#scaling all variables
+df[,2:157] = as.data.frame(apply(df[,2:157],2,scale))
+
+#model predicting happy, using the features with a beta > .1 og < -.1 in the elastic net
+happyFitFull <- brm(happy ~ MCEP_20_IQR + MCEP_5_median + HMPDD_11_IQR + MCEP_8_IQR + MCEP_23_median + HMPDD_2_IQR + f0_IQR + MCEP_3_median + MCEP_8_median + MCEP_2_IQR + MCEP_1_median + MCEP_11_median + HMPDD_0_median + MCEP_11_IQR + MCEP_4_median + MCEP_6_median +  (1|actor) + (1|intensity), 
+            data = df, family = bernoulli(), cores = 4, chains = 4, control = list( adapt_delta = .99))
+
+#model predicting sad, using the features with a beta > .1 og < -.1 in the elastic net
+sadFitFull <- brm(sad ~  MCEP_23_IQR + MCEP_13_IQR + F4_IQR + MCEP_16_IQR + MCEP_12_median + HMPDM_3_median + F2_median + MCEP_15_IQR +  MCEP_6_IQR + HMPDD_11_median + MDQ_median + MCEP_3_IQR + MCEP_7_median + NAQ_IQR + MCEP_18_IQR + MCEP_0_IQR + MCEP_0_median + f0_IQR + (1|actor) + (1|intensity), 
+            data = df, family = bernoulli(), cores = 4, chains = 4, control = list( adapt_delta = .99))
+
+#model predicting angry, using the features with a beta > .1 og < -.1 in the elastic net
+angryFitFull <- brm(angry ~ HMPDD_9_median + PSP_median + PSP_median + HMPDD_1_median + Rd_conf_IQR + MCEP_4_median + MCEP_24_IQR + MCEP_6_IQR +  HMPDD_6_IQR + MCEP_18_median + peakSlope_median + MCEP_3_IQR + MCEP_13_median + MCEP_2_IQR + MCEP_24_median + MCEP_6_median + Rd_conf_median + MCEP_11_median + MCEP_15_median + MCEP_2_median + MCEP_7_median + MCEP_8_median + MCEP_0_IQR + MCEP_0_median + MCEP_7_IQR + (1|actor) + (1|intensity),
+                data = df, family = bernoulli(), cores = 4, chains = 4, control = list(adapt_delta = .99))
+
+#model predicting neutral, using the features with a beta > .1 og < -.1 in the elastic net
+neutralFitFull <- brm(neutral ~  MCEP_24_median + MCEP_13_median + HMPDM_3_IQR + NAQ_IQR + QOQ_median +  MCEP_2_median + MCEP_0_median + MCEP_19_median + NAQ_median + VUV_IQR + (1|actor) + (1|intensity), 
+            data = df, family = bernoulli(), cores = 4, chains = 4, control = list( adapt_delta = .99))
+
+save(happyFitFull, file = 'happyFitFull.RData')
+save(angryFitFull, file= 'angryFitFull.RData')
+save(sadFitFull, file = 'sadFitFull.RData')
+save(neutralFitFull, file = 'neutralFitFull.RData')
+
+
+load('happyFitFull1.RData')
+load('sadFitFull1.RData')
+load('angryFitFull1.RData')
+load('neutralFitFull1.RData')
+
+preddf = df
+
+#calculating predictions
+#adding [,1] to only get the estimate (don't care about uncertainty right now)
+preddf$predAngry = predict(angryFitFull, preddf, re_formula = NA)[,1]
+preddf$predHappy = predict(happyFitFull, preddf, re_formula = NA)[,1]
+preddf$predSad = predict(sadFitFull, preddf, re_formula = NA)[,1]
+preddf$predNeutral = predict(neutralFitFull, preddf, re_formula = NA)[,1]
+
+
+
+#Recoding the factor levels for interpretability
+preddf$emotion = as.factor(recode(preddf$emotion, '3' = 'Happy', '5' = 'Angry', '1' = 'Neutral', '4' = 'Sad'))
+#Adding a column which selects the most confident prediction from the 4 models
+preddf = preddf %>%
+  select(predAngry, predHappy, predSad, predNeutral, emotion) %>%
+  mutate(
+    predictions = case_when(
+      predAngry > predHappy & predAngry > predSad & predAngry > predNeutral ~ "Angry",
+      predHappy > predAngry & predHappy > predSad & predHappy > predNeutral ~ "Happy",
+      predSad > predAngry & predSad > predHappy & predSad > predNeutral ~ 'Sad',
+      TRUE                      ~  "Neutral" ))
+
+preddf$predictions = as.factor(preddf$predictions)
+#calculating confusion matrix
+conf = confusionMatrix(data = preddf$predictions, reference = preddf$emotion)
+conf
+
+```
+
+#Calculating AUCs and creating ROC curves for each emotions vs all the others
+```{r}
+##angry roc
+angrydf = preddf
+angrydf$emotion = as.factor(recode(angrydf$emotion, 'Happy' = '0', 'Angry' = '1', 'Neutral' = '0', 'Sad' = '0'))
+angrydf$predictions = as.factor(recode(angrydf$predictions, 'Happy' = '0', 'Angry' = '1', 'Neutral' = '0', 'Sad' = '0'))
+
+angrydf$emotion = relevel(angrydf$emotion, ref = "0")
+angrydf$predictions = relevel(angrydf$predictions, ref = "0")
+
+angrydf$predictions = as.numeric(angrydf$predictions)
+
+AngryrocCurve = roc(response = angrydf$emotion, predictor = angrydf$predictions)
+Angryauc = auc(AngryrocCurve)
+Angryaucci = ci(AngryrocCurve)
+
+
+##happy roc
+happydf = preddf
+happydf$emotion = as.factor(recode(happydf$emotion, 'Happy' = '1', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '0'))
+happydf$predictions = as.factor(recode(happydf$predictions, 'Happy' = '1', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '0'))
+
+happydf$emotion = relevel(happydf$emotion, ref = "0")
+happydf$predictions = relevel(happydf$predictions, ref = "0")
+
+happydf$predictions = as.numeric(happydf$predictions)
+
+HappyrocCurve = roc(response = happydf$emotion, predictor = happydf$predictions)
+Happyauc = auc(HappyrocCurve)
+Happyaucci = ci(HappyrocCurve)
+
+##sad roc
+saddf = preddf
+saddf$emotion = as.factor(recode(saddf$emotion, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '1'))
+saddf$predictions = as.factor(recode(saddf$predictions, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '1'))
+
+saddf$emotion = relevel(saddf$emotion, ref = "0")
+saddf$predictions = relevel(saddf$predictions, ref = "0")
+
+saddf$predictions = as.numeric(saddf$predictions)
+
+SadrocCurve = roc(response = saddf$emotion, predictor = saddf$predictions)
+Sadauc = auc(SadrocCurve)
+Sadaucci = ci(SadrocCurve)
+
+
+##neutral roc
+neutraldf = preddf
+neutraldf$emotion = as.factor(recode(neutraldf$emotion, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '1', 'Sad' = '0'))
+neutraldf$predictions = as.factor(recode(neutraldf$predictions, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '1', 'Sad' = '0'))
+
+neutraldf$emotion = relevel(neutraldf$emotion, ref = "0")
+neutraldf$predictions = relevel(neutraldf$predictions, ref = "0")
+
+neutraldf$predictions = as.numeric(neutraldf$predictions)
+
+NeutralrocCurve = roc(response = neutraldf$emotion, predictor = neutraldf$predictions)
+Neutralauc = auc(NeutralrocCurve)
+Neutralaucci = ci(NeutralrocCurve)
+
+
+
+AUCs = c(Angryauc,Happyauc, Neutralauc,Sadauc)
+AUCs
+
+Angryaucci
+Happyaucci
+Neutralaucci
+Sadaucci
+
+#ROC curves
+par(pty="s")
+plot(AngryrocCurve, legacy.axes = T, col = 'red')
+plot(HappyrocCurve, legacy.axes = T, add = T, col ='green')
+plot(SadrocCurve, legacy.axes = T, add = T, col = 'blue')
+plot(NeutralrocCurve, legacy.axes = T, add = T)
+legend("bottomright", inset = 0.02, legend = c("Angry", "Sad", "Happy", "Neutral"), col = c("red", "blue", "green", "black"), lty = 1, cex = 0.8)
+title("ROC for each emotion vs all others", cex = 0.8, line = 2.5)
+
+#Multiclass ROC
+preddf$predictions = as.ordered(preddf$predictions)
+multiClass = multiclass.roc(response = preddf$emotion, predictor = preddf$prediction)
+multiClass
+```
+
+#4-fold Cross-validation
+```{r}
+#setting number of folds
+nfolds = 4
+#adding folds, splitting evenly by emotion
+df = fold(df, k = nfolds, cat_col = 'emotion')
+df = as.data.frame(df)
+
+#running cross-validation loop (beware, takes ~20 hours)
+for (i in 1:4){
+  train = df[df$.folds != i,]    #creating training set (all folds except the one)
+  validation = df[df$.folds == i,] #creating testing/validation set (the current fold)
+  
+  happyModel =  brm(happy ~ MCEP_20_IQR + MCEP_5_median + HMPDD_11_IQR + MCEP_8_IQR + MCEP_23_median + HMPDD_2_IQR + f0_IQR + MCEP_3_median + MCEP_8_median + MCEP_2_IQR + MCEP_1_median + MCEP_11_median + HMPDD_0_median + MCEP_11_IQR + MCEP_4_median + MCEP_6_median +  (1|actor) + (1|intensity), 
+            data =train, family = bernoulli(), cores = 4, chains = 4, control = list( adapt_delta = .99))  
+  
+  angryModel = brm(angry ~ HMPDD_9_median + PSP_median + PSP_median + HMPDD_1_median + Rd_conf_IQR + MCEP_4_median + MCEP_24_IQR + MCEP_6_IQR +  HMPDD_6_IQR + MCEP_18_median + peakSlope_median + MCEP_3_IQR + MCEP_13_median + MCEP_2_IQR + MCEP_24_median + MCEP_6_median + Rd_conf_median + MCEP_11_median + MCEP_15_median + MCEP_2_median + MCEP_7_median + MCEP_8_median + MCEP_0_IQR + MCEP_0_median + MCEP_7_IQR + (1|actor) + (1|intensity),
+                data = train, family = bernoulli(), cores = 4, chains = 4, control = list(adapt_delta = .99))
+  
+  sadModel = brm(sad ~  MCEP_23_IQR + MCEP_13_IQR + F4_IQR + MCEP_16_IQR + MCEP_12_median + HMPDM_3_median + F2_median + MCEP_15_IQR +  MCEP_6_IQR + HMPDD_11_median + MDQ_median + MCEP_3_IQR + MCEP_7_median + NAQ_IQR + MCEP_18_IQR + MCEP_0_IQR + MCEP_0_median + f0_IQR + (1|actor) + (1|intensity), 
+            data = train, family = bernoulli(), cores = 4, chains = 4, control = list( adapt_delta = .99))
+  
+  neutralModel = brm(neutral ~  MCEP_24_median + MCEP_13_median + HMPDM_3_IQR + NAQ_IQR + QOQ_median +  MCEP_2_median + MCEP_0_median + MCEP_19_median + NAQ_median + VUV_IQR + (1|actor) + (1|intensity) , 
+            data = train, family = bernoulli(), cores = 4, chains = 4, control = list( adapt_delta = .99))
+  #adding predictions  
+  validation$predAngry = NA
+  validation$predHappy = NA
+  validation$predSad = NA
+  validation$predNeutral = NA
+  
+  validation$predAngry = predict(angryModel, validation, re_formula = NA)[,1]
+  validation$predHappy = predict(happyModel, validation, re_formula = NA)[,1]
+  validation$predSad = predict(sadModel, validation, re_formula = NA)[,1]
+  validation$predNeutral = predict(neutralModel, validation, re_formula = NA)[,1]  
+  #removes column (sometimes necessary to avoid errors)
+  validation$predictions = NA
+  
+  validation$emotion = as.factor(recode(validation$emotion, '3' = 'Happy', '5' = 'Angry', '1' = 'Neutral', '4' = 'Sad'))
+  
+  validation = validation %>%
+  select(predAngry, predHappy, predSad, predNeutral, emotion) %>%
+  mutate(
+    predictions = case_when(
+      predAngry > predHappy & predAngry > predSad & predAngry > predNeutral ~ "Angry",
+      predHappy > predAngry & predHappy > predSad & predHappy > predNeutral ~ "Happy",
+      predSad > predAngry & predSad > predHappy & predSad > predNeutral ~ 'Sad',
+      TRUE                      ~  "Neutral" ))
+
+  validation$predictions = as.factor(validation$predictions)
+  #confusionmatrix ####################################################################
+  conf = confusionMatrix(data = validation$predictions, reference = validation$emotion)
+  #individual ROCS###################################################################
+  
+  ##angry roc
+  angrydf = validation
+  angrydf$emotion = as.factor(recode(angrydf$emotion, 'Happy' = '0', 'Angry' = '1', 'Neutral' = '0', 'Sad' = '0'))
+  angrydf$predictions = as.factor(recode(angrydf$predictions, 'Happy' = '0', 'Angry' = '1', 'Neutral' = '0', 'Sad' = '0'))
+
+  angrydf$emotion = relevel(angrydf$emotion, ref = "0")
+  angrydf$predictions = relevel(angrydf$predictions, ref = "0")
+
+  angrydf$predictions = as.numeric(angrydf$predictions)
+
+  angryRoc = roc(response = angrydf$emotion, predictor = angrydf$predictions)
+  angryAuc = auc(angryRoc)
+  angryAucci = ci(angryRoc)
+
+  ##happy roc
+  happydf = validation
+  happydf$emotion = as.factor(recode(happydf$emotion, 'Happy' = '1', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '0'))
+  happydf$predictions = as.factor(recode(happydf$predictions, 'Happy' = '1', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '0'))
+
+  happydf$emotion = relevel(happydf$emotion, ref = "0")
+  happydf$predictions = relevel(happydf$predictions, ref = "0")
+
+  happydf$predictions = as.numeric(happydf$predictions)
+
+  happyRoc= roc(response = happydf$emotion, predictor = happydf$predictions)
+  happyAuc = auc(happyRoc)
+  happyAucci = ci(happyRoc)
+
+  ##sad roc
+  saddf = validation
+  saddf$emotion = as.factor(recode(saddf$emotion, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '1'))
+  saddf$predictions = as.factor(recode(saddf$predictions, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '0', 'Sad' = '1'))
+
+  saddf$emotion = relevel(saddf$emotion, ref = "0")
+  saddf$predictions = relevel(saddf$predictions, ref = "0")
+
+  saddf$predictions = as.numeric(saddf$predictions)
+
+  sadRoc = roc(response = saddf$emotion, predictor = saddf$predictions)
+  sadAuc = auc(sadRoc)
+  sadAucci = ci(sadRoc)
+
+  ##neutral roc
+  neutraldf = validation
+  neutraldf$emotion = as.factor(recode(neutraldf$emotion, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '1', 'Sad' = '0'))
+  neutraldf$predictions = as.factor(recode(neutraldf$predictions, 'Happy' = '0', 'Angry' = '0', 'Neutral' = '1', 'Sad' = '0'))
+
+  neutraldf$emotion = relevel(neutraldf$emotion, ref = "0")
+  neutraldf$predictions = relevel(neutraldf$predictions, ref = "0")
+
+  neutraldf$predictions = as.numeric(neutraldf$predictions)
+
+  neutralRoc = roc(response = neutraldf$emotion, predictor = neutraldf$predictions)
+  neutralAuc = auc(neutralRoc)
+  neutralAucci = ci(neutralRoc)
+  
+  ##MULTICLASS
+  validation$predictions = as.ordered(validation$predictions)
+  multiClass = multiclass.roc(response = validation$emotion, predictor = validation$prediction)
+  
+  
+  #adding results to df
+  results = data.frame(Accuracy = conf$overall[1],
+                       Kappa = conf$overall[2],
+                       ConfLower = conf$overall[3],
+                       ConfUpper = conf$overall[4],
+                       
+                       AngrySensitivity = conf$byClass[1],
+                       Happyensitivity = conf$byClass[2],
+                       NeutralSensitivity = conf$byClass[3],
+                       SadSensitivity = conf$byClass[4],
+                       
+                       AngrySpecificity = conf$byClass[5],
+                       HappySpecificity = conf$byClass[6],
+                       NeutralSpecificity = conf$byClass[7],
+                       SadSpecificity = conf$byClass[8],
+                       
+                       AngryPPV = conf$byClass[9],
+                       HappyPPV = conf$byClass[10],
+                       NeutralPPV = conf$byClass[11],
+                       SadPPV = conf$byClass[12],
+                       
+                       AngryNPV = conf$byClass[13],
+                       HappyNPV = conf$byClass[14],
+                       NeutralNPV = conf$byClass[15],
+                       SadNPV = conf$byClass[16],
+                       
+                       AngryPrecision = conf$byClass[17],
+                       HappyPrecision = conf$byClass[18],
+                       NeutralPrecision = conf$byClass[19],
+                       SadPrecision = conf$byClass[20],
+                       
+                       AngryRecall = conf$byClass[21],
+                       HappyRecall = conf$byClass[22],
+                       NeutralRecall = conf$byClass[23],
+                       SadRecall = conf$byClass[24],
+                       
+                       AngryF1 = conf$byClass[25],
+                       HappyF1 = conf$byClass[26],
+                       NeutralF1 = conf$byClass[27],
+                       SadF1 = conf$byClass[28],
+                       
+                       AngryDetectionRate = conf$byClass[33],
+                       HappyDetectionRate = conf$byClass[34],
+                       NeutralDetectionRate = conf$byClass[35],
+                       SadDetectionRate = conf$byClass[36],
+                       
+                       AngryDetectionPrevalence = conf$byClass[37],
+                       HappyDetectionPrevalence = conf$byClass[38],
+                       NeutralDetectionPrevalence = conf$byClass[39],
+                       SadDetectionPrevalence = conf$byClass[40],
+                       
+                       AngryBalancedAccuracy = conf$byClass[41],
+                       HappyBalancedAccuracy = conf$byClass[42],
+                       NeutralBalancedAccuracy = conf$byClass[43],
+                       SadBalancedAccuracy = conf$byClass[44],
+                       
+                       AngryAUC = angryAuc[1],
+                       HappyAUC = happyAuc[1],
+                       NeutralAUC = neutralAuc[1],
+                       SadAUC = sadAuc[1],
+                       
+                       AngryAUCLower = angryAucci[1],
+                       HappyAUCLower = happyAucci[1],
+                       NeutralAUCLower = neutralAucci[1],
+                       SadAUCLower = sadAucci[1],
+                       
+                       AngryAUCUpper = angryAucci[3],
+                       HappyAUCUpper = happyAucci[3],
+                       NeutralAUCUpper = neutralAucci[3],
+                       SadAUCUpper = sadAucci[3],
+                    
+                       row.names = NULL)
+  if(i == 1){
+    result_df = results
+  }else{
+    result_df = rbind(result_df, results)
+  }
+  
+}
+
+save(result_df, file = 'cv_results.RData')
+
+
+
+```
+
+#Summarizing results
+```{r}
+sum_results = result_df %>% 
+  summarise_at(.vars = names(.)[1:56],
+               .funs = c(mean="mean"))
+
+```
+
+#Testing on other datasets
+#UMSSED dataset
+#Loading and merging data
+```{r}
+setwd("~/Desktop/SocKultExam/mp3")
+
+#creating a list of the folders where the files are
+folders = list.files(path = "/home/lasse/Desktop/SocKultExam/mp3")
+#creating a list of all the .csv files in all the folders
+file.list <- list.files(folders, pattern = '*.csv', full.names = T)
+folders = folders[2]
+#reading all the csv files in the file.list
+df.list <- lapply(file.list, trimload)
+#turning into a data frame
+dfTrim = bind_rows(df.list)
+
+dfTrim = as.data.frame(dfTrim)
+
+```
+
+#Summarizing testing data
+```{r}
+df = dfTrim
+
+df = df[complete.cases(df),]
+
+
+sumdf = df %>% 
+  group_by(filename) %>% 
+  summarise_at(.vars = names(.)[1:81],
+               .funs = c(median="median", IQR = "IQR"))
+
+sumdf = as.data.frame(sumdf)
+
+#adding IDs
+sumdf$emotion = str_sub(sumdf$filename, start = 16, end = 16)
+sumdf$actor = str_sub(sumdf$filename, start = 1, end = 2)
+
+#adding dummy columns for each emotion we are interested in   
+sumdf$neutral = ifelse(sumdf$emotion == "N", 1, 0)
+sumdf$happy = ifelse(sumdf$emotion == "H", 1, 0)
+sumdf$sad = ifelse(sumdf$emotion == "S", 1, 0)
+sumdf$angry = ifelse(sumdf$emotion == "A", 1, 0)
+
+write.csv(sumdf, file = "UMSSEDTrimSumData.csv")
+```
+
+#Testing predictions
+```{r}
+setwd("~/Desktop/SocKultExam/mp3")
+
+preddf = read.csv("UMSSEDTrimSumData.csv")
+preddf$X = NULL
+
+setwd("~/Desktop/SocKultExam/Audio_Speech_Actors_01-24")
+
+load('happyFitFull1.RData')
+load('sadFitFull1.RData')
+load('angryFitFull1.RData')
+load('neutralFitFull1.RData')
+
+
+#adding [,1] to only get the estimate (don't care about uncertainty right now)
+preddf$predAngry = predict(angryFitFull, preddf, re_formula = NA)[,1]
+preddf$predHappy = predict(happyFitFull, preddf, re_formula = NA)[,1]
+preddf$predSad = predict(sadFitFull, preddf, re_formula = NA)[,1]
+preddf$predNeutral = predict(neutralFitFull, preddf, re_formula = NA)[,1]
+
+
+preddf$emotion = as.factor(recode(preddf$emotion, 'H' = 'Happy', 'A' = 'Angry', 'N' = 'Neutral', 'S' = 'Sad'))
+
+preddf = preddf %>%
+  select(predAngry, predHappy, predSad, predNeutral, emotion) %>%
+  mutate(
+    predictions = case_when(
+      predAngry > predHappy & predAngry > predSad & predAngry > predNeutral ~ "Angry",
+      predHappy > predAngry & predHappy > predSad & predHappy > predNeutral ~ "Happy",
+      predSad > predAngry & predSad > predHappy & predSad > predNeutral ~ 'Sad',
+      TRUE                      ~  "Neutral" ))
+
+preddf$predictions = as.factor(preddf$predictions)
+
+conf = confusionMatrix(data = preddf$predictions, reference = preddf$emotion)
+conf
+#Everything's happy :( :( :(
+
+preddf$predictions = as.ordered(preddf$predictions)
+multiClass = multiclass.roc(response = preddf$emotion, predictor = preddf$prediction)
+multiClass
+```
+##Practically everything is predicted as happy. Angry predicts close to zero everytime.
+
+#Testing prediction on the SAVEE dataset
+#Loading and merging data
+```{r}
+setwd("~/Desktop/SocKultExam/AudioData")
+
+#creating a list of the folders where the files are
+folders = list.files(path = "/home/lasse/Desktop/SocKultExam/AudioData")
+#creating a list of all the .csv files in all the folders
+file.list <- list.files(folders, pattern = '*.csv', full.names = T)
+#reading all the csv files in the file.list
+df.list <- lapply(file.list, trimload)
+#turning into a data frame
+dfTrim = bind_rows(df.list)
+
+dfTrim = as.data.frame(dfTrim)
+
+```
+
+#Summarizing testing data
+```{r}
+df = dfTrim
+
+df = df[complete.cases(df),]
+
+
+sumdf = df %>% 
+  group_by(filename) %>% 
+  summarise_at(.vars = names(.)[1:81],
+               .funs = c(median="median", IQR = "IQR"))
+
+sumdf = as.data.frame(sumdf)
+
+#adding IDs
+sumdf$emotion = str_sub(sumdf$filename, start = 4, end = 4)
+sumdf$actor = str_sub(sumdf$filename, start = 1, end = 2)
+
+#adding dummy columns for each emotion we are interested in   
+sumdf$neutral = ifelse(sumdf$emotion == "n", 1, 0)
+sumdf$happy = ifelse(sumdf$emotion == "h", 1, 0)
+sumdf$sad = ifelse(sumdf$emotion == "s", 1, 0)
+sumdf$angry = ifelse(sumdf$emotion == "a", 1, 0)
+
+write.csv(sumdf, file = "SAVEETrimSumData.csv")
+```
+
+#Testing predictions
+```{r}
+setwd("~/Desktop/SocKultExam/AudioData")
+
+preddf = read.csv("SAVEETrimSumData.csv")
+preddf$X = NULL
+
+setwd("~/Desktop/SocKultExam/Audio_Speech_Actors_01-24")
+
+load('happyFitFull1.RData')
+load('sadFitFull1.RData')
+load('angryFitFull1.RData')
+load('neutralFitFull1.RData')
+
+
+#adding [,1] to only get the estimate (don't care about uncertainty right now)
+preddf$predAngry = predict(angryFitFull, preddf, re_formula = NA)[,1]
+preddf$predHappy = predict(happyFitFull, preddf, re_formula = NA)[,1]
+preddf$predSad = predict(sadFitFull, preddf, re_formula = NA)[,1]
+preddf$predNeutral = predict(neutralFitFull, preddf, re_formula = NA)[,1]
+
+
+preddf$emotion = as.factor(recode(preddf$emotion, 'h' = 'Happy', 'a' = 'Angry', 'n' = 'Neutral', 's' = 'Sad'))
+
+preddf = preddf %>%
+  select(predAngry, predHappy, predSad, predNeutral, emotion) %>%
+  mutate(
+    predictions = case_when(
+      predAngry > predHappy & predAngry > predSad & predAngry > predNeutral ~ "Angry",
+      predHappy > predAngry & predHappy > predSad & predHappy > predNeutral ~ "Happy",
+      predSad > predAngry & predSad > predHappy & predSad > predNeutral ~ 'Sad',
+      TRUE                      ~  "Neutral" ))
+
+preddf$predictions = as.factor(preddf$predictions)
+
+conf = confusionMatrix(data = preddf$predictions, reference = preddf$emotion)
+conf
+#Everything's happy :( :( :(
+
+preddf$predictions = as.ordered(preddf$predictions)
+multiClass = multiclass.roc(response = preddf$emotion, predictor = preddf$prediction)
+multiClass
+```
+##EVERYTHING is predicted as happy. Angry predicts close to zero everytime.
+
+
+
+
